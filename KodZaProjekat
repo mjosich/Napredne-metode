@@ -1,0 +1,332 @@
+################################################################################
+#                 Семинарски рад из предмета Напредне методе прикупљања, 
+#                         обраде и приказа географских података
+################################################################################
+# потребне библиотеке
+libs <- c(
+  "tidyverse", "sf", "osmdata",
+  "terra", "httr", "XML"
+)
+
+# инсталирање недостајућих библиотека
+installed_libs <- libs %in% rownames(installed.packages())
+if (any(installed_libs == F)) {
+  install.packages(libs[!installed_libs])
+}
+
+# учитавање библиотека
+invisible(lapply(libs, library, character.only = T))
+
+# 1. ПРЕУЗИМАЊЕ ЛИНКОВА ЗА РАСТЕРЕ
+#--------------------------
+url <-
+  "https://glad.umd.edu/users/Potapov/GLCLUC2020/Built-up_change_2000_2020/"
+
+get_raster_links <- function() {
+  res <- httr::GET(url) # направи http захтјев
+  parse <- XML::htmlParse(res) # парсирај податке у html формат
+  links <- XML::xpathSApply( # скини све href тагове
+    parse,
+    path = "//a", XML::xmlGetAttr, "href"
+  )
+  lnks <- links[-c(1:5)] # ухвати линкове
+  for (l in lnks) { # направи све линкове и стави их у листу
+    rlinks <- paste0(url, lnks)
+  }
+  
+  return(rlinks)
+}
+
+rlinks <- get_raster_links()
+
+# 1. Преузимање података о изграђености о Бијељини lat ~ 19N, long ~ 44E
+#-------------------------------------------------------
+crsLONGLAT <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+load_builtup_data <- function() {
+  l <- rlinks[grepl("50N_010E", rlinks, rlinks)]
+  builtup_data <- terra::rast(l)
+  terra::crs(builtup_data) <- crsLONGLAT
+  
+  return(builtup_data)
+}
+
+builtup_data <- load_builtup_data()
+
+
+# 2. Узимање граница бијељине из "OSM" података
+#--------------------------------------
+#city <- "City of Bijeljina, Republika Srpska, Bosnia and Herzegovina"
+city <- "Bijeljina, Bosnia"
+# дефинисање пројекције
+
+bijeljina_border <- osmdata::getbb(
+  city,
+  format_out = "sf_polygon"
+) |>
+  sf::st_set_crs(crsLONGLAT) |>
+  sf::st_transform(crsLONGLAT)
+
+terra::plot(builtup_data)
+plot(bijeljina_border, add = T)
+
+# 3. Исијецање растера 
+# МЕТОД 1: РАСТЕР
+#-------------------
+crop_builtup_data_with_polygon <- function() {
+  bijeljina_vect <- terra::vect(bijeljina_border)
+  bijeljina_raster <- terra::crop(builtup_data, bijeljina_vect)
+  bijeljina_raster_cropped <- terra::mask(
+    bijeljina_raster, bijeljina_vect
+  )
+  return(bijeljina_raster_cropped)
+}
+
+bijeljina_raster_cropped <- crop_builtup_data_with_polygon()
+terra::plot(bijeljina_raster_cropped)
+
+# 3. Исијецање растера 
+# МЕТОД 2: "BOUNDING BOX"
+#-----------------------
+bbox <- sf::st_bbox(bijeljina_border)
+bbox_poly <- sf::st_sfc(
+  sf::st_polygon(list(cbind(
+    c(
+      bbox["xmin"], bbox["xmax"],
+      bbox["xmax"], bbox["xmin"], bbox["xmin"]
+    ),
+    c(
+      bbox["ymin"], bbox["ymin"],
+      bbox["ymax"], bbox["ymax"], bbox["ymin"]
+    )
+  ))),
+  crs = crsLONGLAT
+)
+
+crop_builtup_data_with_bbox <- function() {
+  bijeljina_vect <- terra::vect(bbox_poly)
+  bijeljina_raster <- terra::crop(builtup_data, bijeljina_vect)
+  bijeljina_raster_cropped <- terra::mask(
+    bijeljina_raster, bijeljina_vect
+  )
+  return(bijeljina_raster_cropped)
+}
+
+bijeljina_raster_cropped <- crop_builtup_data_with_bbox()
+terra::plot(bijeljina_raster_cropped)
+
+# 3. Направити бафер око Бијељине
+# МЕТОД 3: БАФЕР
+#----------------------------
+get_buffer <- function() {
+  bijeljina_cents <- sf::st_centroid(bijeljina_border)
+  bijeljina_circle <- sf::st_buffer(
+    bijeljina_cents,
+    dist = units::set_units(7, km)
+  ) |>
+    sf::st_set_crs(crsLONGLAT) |>
+    sf::st_transform(crs = crsLONGLAT)
+  
+  return(bijeljina_circle)
+}
+
+bijeljina_circle <- get_buffer()
+
+plot
+ggplot() +
+  geom_sf(
+    data = bijeljina_border, color = "#090c73",
+    fill = "transparent", size = 1.5,
+    inherit.aes = FALSE
+  ) +
+  geom_sf(
+    data = bijeljina_circle, color = "#e83778",
+    fill = "transparent", size = 1.5,
+    inherit.aes = FALSE
+  ) +
+  theme_void() +
+  theme(panel.grid.major = element_line("transparent"))
+
+crop_builtup_data <- function() {
+  bijeljina_vect <- terra::vect(bijeljina_circle)
+  bijeljina_raster <- terra::crop(builtup_data, bijeljina_vect)
+  bijeljina_raster_cropped <- terra::mask(
+    bijeljina_raster, bijeljina_vect
+  )
+  return(bijeljina_raster_cropped)
+}
+
+bijeljina_raster_cropped <- crop_builtup_data()
+terra::plot(bijeljina_raster_cropped)
+
+
+# 4. IMAGE TO DATA.FRAME
+#-----------------------
+
+raster_to_df <- function() {
+  bijeljina_df <- terra::as.data.frame(
+    bijeljina_raster_cropped,
+    xy = T
+  )
+  
+  return(bijeljina_df)
+}
+
+bijeljina_df <- raster_to_df()
+head(bijeljina_df)
+names(bijeljina_df)[3] <- "value"
+
+# дефинисање вриједности категорија
+bijeljina_df$cat <- round(bijeljina_df$value, 0)
+bijeljina_df$cat <- factor(bijeljina_df$cat,
+                           labels = c("неизграђено", "ново", "постојеће")
+)
+
+# 5. Узимање путева из "OSM" података за Бијељину
+#---------------------------------
+road_tags <- c(
+  "motorway", "trunk", "primary", "secondary",
+  "tertiary", "motorway_link", "trunk_link", 
+  "primary_link", "secondary_link", "tertiary_link"
+)
+
+get_osm_roads <- function() {
+  bbox <- sf::st_bbox(bijeljina_border)
+  roads <- bbox |>
+    opq() |>
+    add_osm_feature(
+      key = "highway",
+      value = road_tags
+    ) |>
+    osmdata::osmdata_sf()
+  
+  return(roads)
+}
+
+roads <- get_osm_roads()
+bijeljina_roads <- roads$osm_lines |>
+  sf::st_set_crs(crsLONGLAT) |>
+  sf::st_transform(crs = crsLONGLAT)
+
+ggplot() +
+  geom_sf(
+    data = bijeljina_circle, fill = "transparent",
+    #data = bijeljina_border, fill = "transparent",
+    color = "#090c73", size = 1.2,
+    inherit.aes = FALSE
+  ) +
+  geom_sf(
+    data = bijeljina_roads,
+    color = "#e83778", inherit.aes = FALSE
+  ) +
+  theme_void() +
+  theme(panel.grid.major = element_line("transparent"))
+
+# 6. Исијецање путева за Бијељину са бафером
+#--------------------------------
+bijeljina_roads_cropped <- sf::st_intersection(
+  bijeljina_roads, bijeljina_circle
+  #bijeljina_roads, bijeljina_border
+)
+
+ggplot() +
+  geom_sf(
+    data = bijeljina_circle,
+    #data = bijeljina_vect,
+    color = "#090c73", fill = NA,
+    size = 1.2, inherit.aes = FALSE
+  ) +
+  geom_sf(
+    data = bijeljina_roads_cropped, fill = "transparent",
+    color = "#e83778", inherit.aes = FALSE
+  ) +
+  theme_void() +
+  theme(panel.grid.major = element_line("transparent"))
+
+# 7. МАПА
+#-------
+colrs <- c(
+  "gray40", "#ba0933", "#2775e3"
+)
+
+p <- ggplot() +
+  geom_raster(
+    data = bijeljina_df,
+    aes(x = x, y = y, fill = cat),
+    alpha = 1
+    
+  ) +
+  geom_sf(
+    data = bijeljina_roads_cropped,
+    color = "gray40",
+    size = .1,
+    alpha = 1,
+    fill = "transparent"
+    #) +
+    #geom_sf(
+    #  data = bijeljina_border,
+    # color = "gray40",
+    # alpha = 0.05,
+    # fill = "transparent"
+  ) +
+  scale_fill_manual(
+    name = "",
+    values = colrs,
+    drop = F
+  ) +
+  guides(
+    fill = guide_legend(
+      direction = "horizontal",
+      keyheight = unit(1.5, units = "mm"),
+      keywidth = unit(35, units = "mm"),
+      title.position = "top",
+      title.hjust = .5,
+      label.hjust = .5,
+      nrow = 1,
+      byrow = T,
+      reverse = F,
+      label.position = "top"
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    axis.line = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    legend.position = c(.5, 1.05),
+    legend.text = element_text(size = 12, color = "white"),
+    legend.title = element_text(size = 14, color = "white"),
+    legend.spacing.y = unit(0.25, "cm"),
+    panel.grid.major = element_line(color = "gray40", size = 0.2),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(
+      size = 20, color = "grey80", hjust = .5, vjust = 2
+    ),
+    plot.caption = element_text(
+      size = 9, color = "grey90", hjust = .5, vjust = 5
+    ),
+    plot.margin = unit(
+      c(t = 1, r = 0, b = 0, l = 0), "lines"
+    ),
+    plot.background = element_rect(fill = "gray40", color = NA),
+    panel.background = element_rect(fill = "gray40", color = NA),
+    legend.background = element_rect(fill = "gray40", color = NA),
+    legend.key = element_rect(colour = "white"),
+    panel.border = element_blank()
+  ) +
+  labs(
+    x = "",
+    y = NULL,
+    title = "Градско језгро Бијељине",
+    subtitle = "",
+    caption = "Ширење изграђених подручја у периоду 2000-2020\n\nМилан Јосић 2023\nПодаци: GLAD Built-up Change Data & ©OpenStreetMap contributors"
+  )
+
+ggsave(
+  filename = "bijeljina_built_up2.png",
+  width = 6, height = 6, dpi = 600,
+  device = "png", p
+)
